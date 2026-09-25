@@ -1,17 +1,14 @@
-"""Simulates Seanime's isolated runtimes for the plugin payload.
+"""Simulates Seanime's isolated runtimes for the daemon-driver plugin.
 
-Seanime compiles init() in one runtime, captures the $ui.register callback,
-and re-runs it in a SEPARATE UI runtime where outer-scope variables do NOT
-exist. This test reproduces that: it runs the esbuild-compiled payload in
-one node:vm context, extracts the captured callback source, and executes it
-in a fresh context with stubbed Seanime APIs. Any reference to an outer
-variable (like the old HELPER_PY bug) raises ReferenceError here.
+Runs the esbuild-compiled payload in one node:vm context, extracts the
+captured $ui.register callback, and re-executes ONLY its source in a fresh
+context with stubbed Seanime APIs (like Seanime's isolated UI runtime).
+Any reference to an outer variable raises ReferenceError here.
 
-It then drives the plugin: probe(), a playback event, tray render, and the
-registered event handlers -- asserting the helper bytes written equal
-arrpc_helper.py and that --activity/--clear invocations happen.
+Asserts the LiquidBounce-style contract: the plugin NEVER sends activity
+itself -- it spawns ONE daemon via $osExtra.asyncCmd and talks to it only
+through $TEMP command files, while status comes back through status files.
 """
-import json
 import os
 import subprocess
 import sys
@@ -26,11 +23,10 @@ const helperSrc = fs.readFileSync(process.argv[3], "utf8");
 
 function makeStubs(captured) {
     const writes = [];
-    const cmds = [];
+    const spawns = [];
     const settingsStore = {
         enabled: true, pythonBin: "python3", updateIntervalSec: 15,
-        showButtons: true, showTimestamps: true,
-        pauseBehaviour: "show-paused", debug: false,
+        clearOnPause: true, debug: false,
     };
     const trayStub = {
         text: (t) => ({ t }), stack: (items) => items,
@@ -47,7 +43,10 @@ function makeStubs(captured) {
         })},
         state: (initial) => { let v = initial; return { get: () => v, set: (nv) => { v = (typeof nv === "function") ? nv(v) : nv; } }; },
         fieldRef: () => ({ current: null, setValue() {}, onValueChange() {} }),
+        setTimeout: (fn) => { captured.timeouts.push(fn); fn(); return () => {}; },
+        setInterval: () => () => {},
         playback: { registerEventListener: (cb) => { captured.playbackCb = cb; return () => {}; } },
+        // NOTE: no ctx.discord on purpose -- the plugin must not use it.
         newTray: () => trayStub,
         registerEventHandler: (name, cb) => { captured.handlers[name] = cb; },
         toast: { success: () => {}, error: () => {}, info: () => {} },
@@ -61,21 +60,35 @@ function makeStubs(captured) {
         $os: {
             tempDir: () => "/tmp",
             writeFile: (path, data, perm) => { writes.push({ path, data: Buffer.from(data).toString("utf8"), perm }); },
-            cmd: (...args) => {
-                cmds.push(args);
-                return { output: () => (captured.failCmd
-                    ? "ERR FAILED: websocket: port 6463: timed out | ipc: no sockets tried"
-                    : "OK websocket:127.0.0.1:6463") };
+            readFile: (path) => Buffer.from(captured.statusBody),
+        },
+        $osExtra: {
+            asyncCmd: (...args) => {
+                spawns.push(args);
+                return { run: (cb) => { captured.daemonCb = cb; }, getCommand: () => ({}) };
             },
         },
         $ui: { register: (cb) => { captured.registerCb = cb; } },
     };
     vm.createContext(sandbox);
-    return { sandbox, ctx, writes, cmds };
+    return { sandbox, ctx, writes, spawns };
+}
+
+function ev(ep, playing) {
+    return {
+        isVideoStopped: false, isVideoCompleted: false, isStreamStopped: false, isStreamCompleted: false,
+        state: { mediaId: 21, mediaTitle: "One Piece", mediaCoverImage: "http://img/x.jpg",
+                 mediaTotalEpisodes: 100, episodeNumber: ep, filename: "ep.mkv", completionPercentage: 10 },
+        status: { playing: playing, currentTimeInSeconds: 120, durationInSeconds: 1400, filename: "ep.mkv" },
+    };
+}
+
+function cmdWrites(s) {
+    return s.writes.filter((w) => w.path.indexOf("seanime-arrpc-cmd.json") >= 0).map((w) => JSON.parse(w.data));
 }
 
 // --- runtime 1: run init(), capture the register callback ---
-const cap1 = { handlers: {} };
+const cap1 = { handlers: {}, timeouts: [], statusBody: "{}" };
 let s1 = makeStubs(cap1);
 vm.runInContext(compiled + "\ninit();", s1.sandbox);
 if (typeof cap1.registerCb !== "function") {
@@ -84,7 +97,8 @@ if (typeof cap1.registerCb !== "function") {
 }
 
 // --- runtime 2 (fresh): re-run ONLY the callback source, like Seanime ---
-const cap2 = { handlers: {} };
+const cap2 = { handlers: {}, timeouts: [],
+    statusBody: JSON.stringify({ alive: Date.now() / 1000, pid: 999, state: "starting", transport: "", error: "", activity: "" }) };
 let s2 = makeStubs(cap2);
 const cbSource = "(" + cap1.registerCb.toString() + ")";
 let uiFn;
@@ -108,65 +122,68 @@ if (!helperWrite) { console.error("FAIL: helper never written to $TEMP"); proces
 if (helperWrite.data !== helperSrc) { console.error("FAIL: embedded helper differs from arrpc_helper.py"); process.exit(1); }
 console.log("PASS embedded helper byte-identical to arrpc_helper.py");
 
-// drive a playback event -> expect an --activity send via python3
-s2.cmds.length = 0;
-cap2.playbackCb({
-    isVideoStopped: false, isVideoCompleted: false, isStreamStopped: false, isStreamCompleted: false,
-    state: { mediaId: 21, mediaTitle: "One Piece", mediaCoverImage: "http://img/x.jpg",
-             mediaTotalEpisodes: 100, episodeNumber: 1015, filename: "ep.mkv", completionPercentage: 10 },
-    status: { playing: true, currentTimeInSeconds: 120, durationInSeconds: 1400, filename: "ep.mkv" },
-});
-const activityCmd = s2.cmds.find((c) => c.indexOf("--activity") >= 0);
-if (!activityCmd) { console.error("FAIL: playback event sent no --activity. cmds=" + JSON.stringify(s2.cmds)); process.exit(1); }
-if (activityCmd[0] !== "python3") { console.error("FAIL: unexpected binary " + activityCmd[0]); process.exit(1); }
-const act = JSON.parse(activityCmd[activityCmd.indexOf("--activity") + 1]);
+// exactly ONE daemon spawn with the right argv
+if (s2.spawns.length !== 1) { console.error("FAIL: expected 1 daemon spawn, got " + s2.spawns.length); process.exit(1); }
+const sp = s2.spawns[0];
+for (const need of ["--daemon", "--dir", "--client-id", "1224777421941899285"]) {
+    if (sp.indexOf(need) < 0) { console.error("FAIL: daemon argv missing " + need + ": " + JSON.stringify(sp)); process.exit(1); }
+}
+if (sp[0] !== "python3") { console.error("FAIL: unexpected binary " + sp[0]); process.exit(1); }
+console.log("PASS single daemon spawned (async, --daemon --dir --client-id)");
+
+// episode start -> cmd file {op:set, activity One Piece 1015}
+const setsBefore = cmdWrites(s2).filter((c) => c.op === "set").length;
+cap2.playbackCb(ev(1015, true));
+const sets = cmdWrites(s2).filter((c) => c.op === "set");
+if (sets.length !== setsBefore + 1) { console.error("FAIL: no set cmd. writes=" + JSON.stringify(cmdWrites(s2))); process.exit(1); }
+const act = sets[sets.length - 1].activity;
 if (act.details !== "One Piece" || act.state !== "Watching Episode 1015") {
     console.error("FAIL: bad activity " + JSON.stringify(act)); process.exit(1);
 }
-console.log("PASS playback event -> SET_ACTIVITY (One Piece Ep 1015)");
+console.log("PASS episode start -> daemon cmd set (One Piece Ep 1015)");
 
-// stop event -> expect --clear
-s2.cmds.length = 0;
+// tick, same episode -> throttled (no new cmd)
+const nCmds = cmdWrites(s2).length;
+cap2.playbackCb(ev(1015, true));
+if (cmdWrites(s2).length !== nCmds) { console.error("FAIL: unthrottled duplicate cmd"); process.exit(1); }
+console.log("PASS steady-state refresh throttled");
+
+// pause with clearOnPause -> clear cmd
+cap2.playbackCb(ev(1015, false));
+const cmds = cmdWrites(s2);
+if (!cmds.length || cmds[cmds.length - 1].op !== "clear") { console.error("FAIL: pause did not clear"); process.exit(1); }
+console.log("PASS pause -> daemon cmd clear");
+
+// stop event -> clear cmd
 cap2.playbackCb({ isVideoStopped: true, isVideoCompleted: false, isStreamStopped: false, isStreamCompleted: false });
-if (!s2.cmds.find((c) => c.indexOf("--clear") >= 0)) { console.error("FAIL: stop event sent no --clear"); process.exit(1); }
-console.log("PASS stop event -> clear");
+const cmds2 = cmdWrites(s2);
+if (cmds2[cmds2.length - 1].op !== "clear") { console.error("FAIL: stop did not clear"); process.exit(1); }
+console.log("PASS stop event -> daemon cmd clear");
 
-// handlers registered?
+// handlers + render with live status
 for (const h of ["arrpc-probe", "arrpc-clear", "arrpc-toggle"]) {
     if (typeof cap2.handlers[h] !== "function") { console.error("FAIL: missing handler " + h); process.exit(1); }
 }
-cap2.handlers["arrpc-probe"]();
-cap2.handlers["arrpc-clear"]();
-if (typeof cap2.renderFn !== "function") { console.error("FAIL: tray render fn missing"); process.exit(1); }
-cap2.renderFn();
-console.log("PASS tray handlers + render execute");
-
-// failing transport: ERR surfaces in tray, next send skips websocket
-cap2.failCmd = true;
-s2.cmds.length = 0;
-cap2.playbackCb({
-    isVideoStopped: false, isVideoCompleted: false, isStreamStopped: false, isStreamCompleted: false,
-    state: { mediaId: 21, mediaTitle: "One Piece", mediaCoverImage: "",
-             mediaTotalEpisodes: 100, episodeNumber: 1016, filename: "ep.mkv", completionPercentage: 11 },
-    status: { playing: true, currentTimeInSeconds: 130, durationInSeconds: 1400, filename: "ep.mkv" },
-});
+cap2.statusBody = JSON.stringify({ alive: Date.now() / 1000, pid: 999, state: "ok",
+    transport: "ipc:/run/user/1001/discord-ipc-0", error: "", activity: "One Piece Watching Episode 1015" });
 const items = cap2.renderFn();
 const texts = JSON.stringify(items);
-if (texts.indexOf("timed out") < 0) { console.error("FAIL: ERR reason not shown in tray: " + texts); process.exit(1); }
-console.log("PASS ERR reason surfaces in tray status");
-// next (changed-episode) send must go straight to IPC, no websocket attempt
-s2.cmds.length = 0;
-cap2.playbackCb({
-    isVideoStopped: false, isVideoCompleted: false, isStreamStopped: false, isStreamCompleted: false,
-    state: { mediaId: 21, mediaTitle: "One Piece", mediaCoverImage: "",
-             mediaTotalEpisodes: 100, episodeNumber: 1017, filename: "ep.mkv", completionPercentage: 12 },
-    status: { playing: true, currentTimeInSeconds: 140, durationInSeconds: 1400, filename: "ep.mkv" },
-});
-const lastCmd = s2.cmds[s2.cmds.length - 1];
-if (!lastCmd || lastCmd.indexOf("--transport") < 0 || lastCmd[lastCmd.indexOf("--transport") + 1] !== "ipc") {
-    console.error("FAIL: websocket not skipped after failure: " + JSON.stringify(s2.cmds)); process.exit(1);
+for (const need of ["ok", "ipc:/run/user/1001/discord-ipc-0", "One Piece Watching Episode 1015"]) {
+    if (texts.indexOf(need) < 0) { console.error("FAIL: render missing " + need + ": " + texts); process.exit(1); }
 }
-console.log("PASS websocket skipped for session after failure");
+console.log("PASS tray render shows live daemon status");
+
+// probe handler writes a probe cmd
+cap2.handlers["arrpc-probe"]();
+const cmds3 = cmdWrites(s2);
+if (cmds3[cmds3.length - 1].op !== "probe") { console.error("FAIL: probe handler wrote no probe cmd"); process.exit(1); }
+console.log("PASS Test button -> daemon cmd probe");
+
+// toggle off writes exit cmd
+cap2.handlers["arrpc-toggle"]();
+const cmds4 = cmdWrites(s2);
+if (cmds4[cmds4.length - 1].op !== "exit") { console.error("FAIL: toggle-off wrote no exit cmd"); process.exit(1); }
+console.log("PASS Disable -> daemon cmd exit");
 console.log("ALL PLUGIN ISOLATION TESTS PASSED");
 """
 

@@ -9,15 +9,16 @@ Why this helper exists
 ----------------------
 Seanime's built-in Discord RPC only tries the single IPC path
 `$XDG_RUNTIME_DIR/discord-ipc-0`. When Seanime Denshi and the Discord client
-disagree about socket directories (Flatpak, systemd env, Docker, multiple
-clients occupying `discord-ipc-0`), presence silently never appears.
+disagree about socket directories (Flatpak, systemd env differences, Docker,
+multiple clients occupying `discord-ipc-0`), presence silently never appears.
 This helper tries *every* reasonable transport instead:
 
-  1. Discord WebSocket RPC on 127.0.0.1 ports 6463-6472 (same protocol the
+  1. Unix IPC sockets `discord-ipc-0..9` in $XDG_RUNTIME_DIR,
+     /run/user/<uid>, $TMPDIR, /tmp (tried first: it is the native Discord
+     protocol, and some bundled arRPC WebSocket endpoints are broken).
+  2. Discord WebSocket RPC on 127.0.0.1:6463-6472 (same protocol the
      Discord web client uses; arRPC accepts connections with an empty
      Origin header, which browsers cannot send but this script can).
-  2. Unix IPC sockets `discord-ipc-0..9` in $XDG_RUNTIME_DIR,
-     /run/user/<uid>, $TMPDIR, /tmp.
 
 First transport that completes a handshake + SET_ACTIVITY wins.
 
@@ -25,6 +26,7 @@ Usage (called by the Seanime plugin, but also usable by hand):
   python3 arrpc_helper.py --client-id 1224777421941899285 --activity '<json>'
   python3 arrpc_helper.py --client-id 1224777421941899285 --clear
   python3 arrpc_helper.py --client-id 1224777421941899285 --probe
+  python3 arrpc_helper.py --client-id 1224777421941899285 --daemon --dir /tmp/x
 
 Exit code 0 + "OK <transport>" on stdout means the activity was accepted.
 Anything else is an error (message on stderr, exit code 1).
@@ -34,12 +36,14 @@ Only the Python standard library is used.
 
 import argparse
 import base64
+import glob
 import hashlib
 import json
 import os
 import socket
 import struct
 import sys
+import time
 import uuid
 
 # Discord RPC IPC framing (matches OpenAsar/arRPC transports/ipc.js).
@@ -212,8 +216,12 @@ def ws_wait_ready(reader, sock, port):
     return payload
 
 
-def try_websocket(client_id, payload_obj):
-    """Try SET_ACTIVITY over arRPC WebSocket RPC. Returns server reply dict."""
+def ws_connect(client_id):
+    """Connect + handshake to the first healthy WebSocket RPC port.
+
+    Returns (open socket, SockReader, "websocket:127.0.0.1:<port>").
+    The caller owns the socket (hold it for persistent presence).
+    """
     errors = []
     for port in ws_ports():
         sock = None
@@ -237,33 +245,12 @@ def try_websocket(client_id, payload_obj):
             reader = SockReader(sock)
             code, _ = ws_read_http_response(reader)
             if code != 101:
-                errors.append("port %d: HTTP %s" % (port, code))
-                continue
+                raise ConnectionError("port %d: HTTP %s" % (port, code))
             # arRPC sends DISPATCH/READY immediately on connect.
-            try:
-                ws_wait_ready(reader, sock, port)
-            except Exception as exc:
-                errors.append(str(exc))
-                continue
-            # Send SET_ACTIVITY.
-            ws_send_text(sock, json.dumps(payload_obj))
-            # Read reply (skip pings).
-            for _ in range(5):
-                opcode, payload = ws_recv_frame(reader)
-                if opcode == 9:  # ping -> pong
-                    pong = bytearray([0x8A, 0x00])
-                    sock.sendall(bytes(pong))
-                    continue
-                if opcode == 8:
-                    raise ConnectionError("server closed connection")
-                break
-            reply = json.loads(payload.decode("utf-8"))
-            if isinstance(reply, dict) and reply.get("evt") == "ERROR":
-                raise RuntimeError("arRPC error: %s" % reply)
-            return reply, "websocket:127.0.0.1:%d" % port
+            ws_wait_ready(reader, sock, port)
+            return sock, reader, "websocket:127.0.0.1:%d" % port
         except Exception as exc:  # try next port
             errors.append("port %d: %s" % (port, exc))
-        finally:
             if sock is not None:
                 try:
                     sock.close()
@@ -272,45 +259,46 @@ def try_websocket(client_id, payload_obj):
     raise ConnectionError("websocket failed (%s)" % " | ".join(errors or ["no ports tried"]))
 
 
+def ws_request(sock, reader, payload_obj):
+    """Send one SET_ACTIVITY payload over a connected socket. Returns reply."""
+    ws_send_text(sock, json.dumps(payload_obj))
+    # Read reply (skip pings).
+    for _ in range(5):
+        opcode, payload = ws_recv_frame(reader)
+        if opcode == 9:  # ping -> pong
+            pong = bytearray([0x8A, 0x00])
+            sock.sendall(bytes(pong))
+            continue
+        if opcode == 8:
+            raise ConnectionError("server closed connection")
+        break
+    reply = json.loads(payload.decode("utf-8"))
+    if isinstance(reply, dict) and reply.get("evt") == "ERROR":
+        raise RuntimeError("arRPC error: %s" % reply)
+    return reply
+
+
+def try_websocket(client_id, payload_obj):
+    """Try SET_ACTIVITY over arRPC WebSocket RPC. Returns server reply dict."""
+    sock, reader, where = ws_connect(client_id)
+    try:
+        reply = ws_request(sock, reader, payload_obj)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    return reply, where
+
+
 def ws_probe(client_id):
     """Handshake-only check used by the plugin's Test button."""
-    errors = []
-    for port in ws_ports():
-        sock = None
-        try:
-            sock = socket.create_connection(("127.0.0.1", port), CONNECT_TIMEOUT)
-            sock.settimeout(IO_TIMEOUT)
-            key = base64.b64encode(os.urandom(16)).decode("ascii")
-            req = (
-                "GET /?v=1&client_id={cid} HTTP/1.1\r\n"
-                "Host: 127.0.0.1:{port}\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                "Sec-WebSocket-Key: {key}\r\n"
-                "Sec-WebSocket-Version: 13\r\n"
-                "\r\n"
-            ).format(cid=client_id, port=port, key=key)
-            sock.sendall(req.encode("latin-1"))
-            reader = SockReader(sock)
-            code, _ = ws_read_http_response(reader)
-            if code != 101:
-                errors.append("port %d: HTTP %s" % (port, code))
-                continue
-            try:
-                ws_wait_ready(reader, sock, port)
-            except Exception as exc:
-                errors.append(str(exc))
-                continue
-            return "websocket:127.0.0.1:%d" % port
-        except Exception as exc:
-            errors.append("port %d: %s" % (port, exc))
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-    raise ConnectionError("websocket probe failed (%s)" % " | ".join(errors or ["no ports tried"]))
+    sock, _, where = ws_connect(client_id)
+    try:
+        sock.close()
+    except Exception:
+        pass
+    return where
 
 
 # --------------------------------------------------------------------------
@@ -332,14 +320,48 @@ def ipc_candidate_dirs():
     except Exception:
         pass
     dirs.append("/tmp")
+    # Sandbox layouts
+    # (their discord-ipc fork probes snap.discord + app/com.discordapp.Discord
+    # under each base dir) -- plus the Flatpak xdg-run layout used by
+    # Equibop/Vesktop (`.../.flatpak/<app-id>/xdg-run`), which theirs misses
+    # but which is where those sockets actually live on the host.
+    extra = []
+    for base in list(dirs):
+        for sub in ("snap.discord", "app/com.discordapp.Discord"):
+            extra.append(os.path.join(base, sub))
     # Dedupe, keep order, keep only existing directories.
     seen = set()
     out = []
-    for d in dirs:
+    for d in dirs + extra + flatpak_socket_dirs():
         if d and d not in seen:
             seen.add(d)
             if os.path.isdir(d):
                 out.append(d)
+    return out
+
+
+def flatpak_socket_dirs():
+    """Host-visible xdg-run dirs of Flatpak apps (Equibop, Vesktop, ...).
+
+    A Flatpak's $XDG_RUNTIME_DIR is visible on the host at
+    /run/user/<uid>/.flatpak/<app-id>/, with its sockets in xdg-run/.
+    """
+    out = []
+    bases = []
+    if os.environ.get("XDG_RUNTIME_DIR"):
+        bases.append(os.environ["XDG_RUNTIME_DIR"])
+    try:
+        bases.append("/run/user/%d" % os.getuid())
+    except Exception:
+        pass
+    for base in bases:
+        try:
+            matches = sorted(glob.glob(os.path.join(base, ".flatpak", "*", "xdg-run")))
+        except Exception:
+            continue
+        for m in matches:
+            if os.path.isdir(m):
+                out.append(m)
     return out
 
 
@@ -357,8 +379,13 @@ def ipc_recv(sock):
     return opcode, json.loads(payload.decode("utf-8"))
 
 
-def try_ipc(client_id, payload_obj):
-    last_err = "no sockets tried"
+def ipc_connect(client_id):
+    """Connect + handshake to the first reachable IPC socket.
+
+    Returns (open socket, "ipc:<path>"). The caller owns the socket
+    (hold it for persistent presence, close it when done).
+    """
+    errors = []
     for directory in ipc_candidate_dirs():
         for i in IPC_TRIES:
             path = os.path.join(directory, "discord-ipc-%d" % i)
@@ -381,53 +408,306 @@ def try_ipc(client_id, payload_obj):
                     if opcode == OP_CLOSE:
                         raise ConnectionError("closed: %s" % msg)
                     break
-                ipc_send(sock, OP_FRAME, json.dumps(payload_obj))
-                opcode, reply = ipc_recv(sock)
-                if opcode == OP_CLOSE:
-                    raise RuntimeError("arRPC error: %s" % reply)
-                if isinstance(reply, dict):
-                    data = reply.get("data") or {}
-                    if isinstance(data, dict) and data.get("code", 0) > 1000:
-                        raise RuntimeError("arRPC error: %s" % data)
-                return reply, "ipc:%s" % path
+                return sock, "ipc:%s" % path
             except Exception as exc:
-                last_err = "%s: %s" % (path, exc)
-            finally:
+                errors.append("%s: %s" % (path, exc))
                 if sock is not None:
                     try:
                         sock.close()
                     except Exception:
                         pass
-    raise ConnectionError("ipc failed (%s)" % last_err)
+    raise ConnectionError("ipc failed (%s)" % " | ".join(errors or ["no sockets tried"]))
+
+
+def ipc_request(sock, payload_obj):
+    """Send one SET_ACTIVITY payload over a connected socket. Returns reply."""
+    ipc_send(sock, OP_FRAME, json.dumps(payload_obj))
+    for _ in range(3):
+        opcode, reply = ipc_recv(sock)
+        if opcode == OP_PING:
+            ipc_send(sock, OP_PONG, "{}")
+            continue
+        break
+    if opcode == OP_CLOSE:
+        raise RuntimeError("arRPC error: %s" % reply)
+    if isinstance(reply, dict):
+        data = reply.get("data") or {}
+        if isinstance(data, dict) and data.get("code", 0) > 1000:
+            raise RuntimeError("arRPC error: %s" % data)
+    return reply
+
+
+def try_ipc(client_id, payload_obj):
+    sock, where = ipc_connect(client_id)
+    try:
+        reply = ipc_request(sock, payload_obj)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    return reply, where
 
 
 def ipc_probe(client_id):
-    last_err = "no sockets tried"
-    for directory in ipc_candidate_dirs():
-        for i in IPC_TRIES:
-            path = os.path.join(directory, "discord-ipc-%d" % i)
-            if not os.path.exists(path):
-                continue
-            sock = None
+    sock, where = ipc_connect(client_id)
+    try:
+        sock.close()
+    except Exception:
+        pass
+    return where
+
+
+# --------------------------------------------------------------------------
+# Persistent daemon (holds ONE connection, applies file commands)
+# --------------------------------------------------------------------------
+
+CMD_FILENAME = "seanime-arrpc-cmd.json"
+STATUS_FILENAME = "seanime-arrpc-status.json"
+TAKEOVER_AFTER_SEC = 20.0
+WS_RETRY_AFTER_SEC = 60.0
+# Re-assert the current activity this often: heals a silently dropped
+# connection (e.g. the Discord client restarted) while otherwise idle.
+REASSERT_AFTER_SEC = 60.0
+
+
+def _atomic_write_json(path, obj):
+    tmp = path + ".tmp-%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+class Daemon(object):
+    """Holds a single arRPC connection and applies plugin commands.
+
+    The Seanime plugin cannot keep sockets (Goja has no socket API and each
+    callback runs isolated), so this daemon owns the connection instead.
+    Commands arrive via <dir>/seanime-arrpc-cmd.json:
+        {"op": "set", "activity": {...}, "nonce": 7}
+        {"op": "clear", "nonce": 8}
+        {"op": "probe", "nonce": 9}
+        {"op": "exit", "nonce": 10}
+    Status (heartbeat + last result) goes to <dir>/seanime-arrpc-status.json.
+    """
+
+    def __init__(self, client_id, directory, interval, transport):
+        self.client_id = client_id
+        self.directory = directory
+        self.interval = interval
+        self.transport = transport
+        self.pid = os.getpid()
+        self.cmd_path = os.path.join(directory, CMD_FILENAME)
+        self.status_path = os.path.join(directory, STATUS_FILENAME)
+        self.sock = None
+        self.reader = None
+        self.kind = None  # "ipc" | "websocket"
+        self.where = ""
+        self.last_nonce = None
+        self.last_activity = None
+        self.last_send_at = 0.0
+        self.state = {"state": "starting", "transport": "", "error": "",
+                      "activity": ""}
+        self.ws_cooldown_until = 0.0
+        self._last_note = ""
+
+    def note(self, msg):
+        # Print transitions only -- a per-tick log would spam the plugin console.
+        if msg != self._last_note:
+            self._last_note = msg
+            print("DAEMON %s" % msg, flush=True)
+
+    def dump(self):
+        try:
+            body = {"alive": time.time(), "pid": self.pid}
+            body.update(self.state)
+            _atomic_write_json(self.status_path, body)
+        except Exception as exc:
+            eprint("daemon status write failed: %s" % exc)
+
+    def close_socket(self):
+        if self.sock is not None:
             try:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(IO_TIMEOUT)
-                sock.connect(path)
-                ipc_send(sock, OP_HANDSHAKE,
-                         json.dumps({"v": "1", "client_id": client_id}))
-                opcode, _ = ipc_recv(sock)
-                if opcode == OP_CLOSE:
-                    raise ConnectionError("closed")
-                return "ipc:%s" % path
+                self.sock.close()
+            except Exception:
+                pass
+        self.sock = None
+        self.reader = None
+        self.kind = None
+        self.where = ""
+
+    def connect(self):
+        """(Re)discover and handshake. Returns transport string."""
+        self.close_socket()
+        errors = []
+        use_ipc = self.transport in ("auto", "ipc")
+        use_ws = self.transport in ("auto", "websocket")
+        if use_ws and time.time() < self.ws_cooldown_until:
+            use_ws = False
+        if use_ipc:
+            try:
+                self.sock, self.where = ipc_connect(self.client_id)
+                self.kind = "ipc"
+                self.state["transport"] = self.where
+                return self.where
             except Exception as exc:
-                last_err = "%s: %s" % (path, exc)
-            finally:
-                if sock is not None:
+                errors.append("ipc: %s" % exc)
+        if use_ws:
+            try:
+                self.sock, self.reader, self.where = ws_connect(self.client_id)
+                self.kind = "websocket"
+                self.state["transport"] = self.where
+                return self.where
+            except Exception as exc:
+                errors.append("websocket: %s" % exc)
+                # A broken WS endpoint (accepts then goes silent) is usually
+                # broken for good -- back off before retrying it.
+                self.ws_cooldown_until = time.time() + WS_RETRY_AFTER_SEC
+        raise ConnectionError(" | ".join(errors) or "no transport")
+
+    def send(self, activity):
+        payload = build_payload(self.client_id, activity, self.pid)
+        if self.kind == "ipc":
+            return ipc_request(self.sock, payload)
+        return ws_request(self.sock, self.reader, payload)
+
+    def apply_set(self, activity):
+        try:
+            if self.sock is None:
+                self.connect()
+            self.send(activity)
+        except Exception:
+            # Reconnect once, then retry the send on the fresh socket.
+            self.connect()
+            self.send(activity)
+        if activity:
+            details = activity.get("details", "")
+            state = activity.get("state", "")
+            self.state["activity"] = ("%s %s" % (details, state)).strip()
+        else:
+            self.state["activity"] = ""
+        self.last_activity = activity
+        self.last_send_at = time.time()
+        self.state["state"] = "ok"
+        self.state["error"] = ""
+
+    def apply_probe(self):
+        """Handshake test that never disturbs the held connection."""
+        errors = []
+        if self.transport in ("auto", "ipc"):
+            try:
+                where = ipc_probe(self.client_id)
+                self.state["transport"] = where
+                self.state["state"] = "ok"
+                self.state["error"] = ""
+                return
+            except Exception as exc:
+                errors.append("ipc: %s" % exc)
+        if self.transport in ("auto", "websocket"):
+            try:
+                where = ws_probe(self.client_id)
+                self.state["transport"] = where
+                self.state["state"] = "ok"
+                self.state["error"] = ""
+                return
+            except Exception as exc:
+                errors.append("websocket: %s" % exc)
+        self.state["state"] = "error"
+        self.state["error"] = "PROBE FAILED: %s" % " | ".join(errors)
+
+    def read_cmd(self):
+        # The nonce (not the mtime) is the trigger: a failed desired-state
+        # op keeps its nonce unapplied so it is retried every tick until
+        # the server is reachable again.
+        try:
+            with open(self.cmd_path, encoding="utf-8") as f:
+                cmd = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(cmd, dict):
+            return None
+        if cmd.get("nonce") == self.last_nonce:
+            return None
+        return cmd
+
+    def run(self):
+        # Takeover: if another daemon is alive, quietly exit.
+        try:
+            with open(self.status_path, encoding="utf-8") as f:
+                prev = json.load(f)
+            if (time.time() - prev.get("alive", 0) < TAKEOVER_AFTER_SEC
+                    and prev.get("pid") not in (None, self.pid)):
+                print("DAEMON another instance alive (pid %s), exiting"
+                      % prev.get("pid"), flush=True)
+                return 0
+        except Exception:
+            pass
+        self.note("started (pid %d)" % self.pid)
+        self.dump()
+        try:
+            while True:
+                try:
+                    cmd = self.read_cmd()
+                    if cmd and cmd.get("nonce") != self.last_nonce:
+                        op = cmd.get("op")
+                        if op == "exit":
+                            try:
+                                if self.sock is None:
+                                    self.connect()
+                                self.send(None)
+                            except Exception:
+                                pass
+                            self.note("exit requested")
+                            return 0
+                        if op == "set":
+                            self.apply_set(cmd.get("activity"))
+                            self.note("set %s via %s"
+                                      % (self.state["activity"], self.state["transport"]))
+                        elif op == "clear":
+                            self.apply_set(None)
+                            self.note("cleared")
+                        elif op == "probe":
+                            self.apply_probe()
+                            self.note("probe -> %s %s"
+                                      % (self.state["state"], self.state["transport"] or self.state["error"]))
+                        # Desired-state ops converge by retrying until they
+                        # succeed; one-shot reports (probe) are kept as-is.
+                        self.last_nonce = cmd.get("nonce")
+                except Exception as exc:
+                    self.close_socket()
+                    self.state["state"] = "error"
+                    self.state["error"] = str(exc)
+                    self.note("error: %s" % exc)
+                    if cmd and cmd.get("op") in ("set", "clear"):
+                        self.last_nonce = None  # retry desired state
+                    else:
+                        self.last_nonce = cmd.get("nonce") if cmd else self.last_nonce
+                # Keepalive: re-assert current activity so a silently dropped
+                # connection (client restarted while idle) heals itself.
+                if (self.sock is not None and self.last_activity
+                        and time.time() - self.last_send_at > REASSERT_AFTER_SEC):
                     try:
-                        sock.close()
-                    except Exception:
-                        pass
-    raise ConnectionError("ipc probe failed (%s)" % last_err)
+                        self.send(self.last_activity)
+                        self.last_send_at = time.time()
+                    except Exception as exc:
+                        self.close_socket()
+                        self.state["state"] = "error"
+                        self.state["error"] = str(exc)
+                        self.note("keepalive failed, will reconnect: %s" % exc)
+                self.dump()
+                time.sleep(self.interval)
+        finally:
+            self.close_socket()
+        return 0
+
+
+def run_daemon(client_id, directory, interval, transport):
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except Exception as exc:
+        eprint("cannot create %s: %s" % (directory, exc))
+        return 1
+    return Daemon(client_id, directory, interval, transport).run()
 
 
 # --------------------------------------------------------------------------
@@ -446,7 +726,14 @@ def main(argv=None):
     global IO_TIMEOUT
     ap = argparse.ArgumentParser(description="Seanime -> arRPC bridge helper")
     ap.add_argument("--client-id", required=True)
-    group = ap.add_mutually_exclusive_group(required=True)
+    ap.add_argument("--daemon", action="store_true",
+                    help="run persistent daemon (holds one connection, "
+                         "applies JSON commands from --dir)")
+    ap.add_argument("--dir", default=None,
+                    help="working dir for daemon cmd/status files")
+    ap.add_argument("--interval", type=float, default=1.0,
+                    help="daemon poll interval in seconds")
+    group = ap.add_mutually_exclusive_group(required=False)
     group.add_argument("--activity", default=None,
                        help="JSON activity object (Discord activity struct)")
     group.add_argument("--clear", action="store_true",
@@ -461,18 +748,25 @@ def main(argv=None):
 
     IO_TIMEOUT = args.timeout
 
+    if args.daemon:
+        if not args.dir:
+            eprint("--daemon requires --dir")
+            return 2
+        return run_daemon(args.client_id, args.dir, args.interval,
+                          args.transport)
+
     if args.probe:
         errors = []
-        if args.transport in ("auto", "websocket"):
+        if args.transport in ("auto", "ipc"):
             try:
-                where = ws_probe(args.client_id)
+                where = ipc_probe(args.client_id)
                 print("OK %s" % where)
                 return 0
             except Exception as exc:
                 errors.append(str(exc))
-        if args.transport in ("auto", "ipc"):
+        if args.transport in ("auto", "websocket"):
             try:
-                where = ipc_probe(args.client_id)
+                where = ws_probe(args.client_id)
                 print("OK %s" % where)
                 return 0
             except Exception as exc:
@@ -497,13 +791,6 @@ def main(argv=None):
 
     payload = build_payload(args.client_id, activity, args.pid)
     errors = []
-    if args.transport in ("auto", "websocket"):
-        try:
-            _, where = try_websocket(args.client_id, payload)
-            print("OK %s" % where)
-            return 0
-        except Exception as exc:
-            errors.append("websocket: %s" % exc)
     if args.transport in ("auto", "ipc"):
         try:
             _, where = try_ipc(args.client_id, payload)
@@ -511,6 +798,13 @@ def main(argv=None):
             return 0
         except Exception as exc:
             errors.append("ipc: %s" % exc)
+    if args.transport in ("auto", "websocket"):
+        try:
+            _, where = try_websocket(args.client_id, payload)
+            print("OK %s" % where)
+            return 0
+        except Exception as exc:
+            errors.append("websocket: %s" % exc)
     eprint("FAILED: %s" % " | ".join(errors))
     eprint("HINT: enable arRPC in Equibop Settings -> Rich Presence, "
            "or run a standalone server with `npx arrpc`.")

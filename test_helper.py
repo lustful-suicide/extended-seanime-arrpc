@@ -117,7 +117,8 @@ def test_websocket():
     stop = threading.Event()
     t = threading.Thread(target=ws_serve_forever, args=(srv, "set", stop))
     t.start()
-    env = {"ARRPC_WS_PORTS": str(WS_PORT)}
+    # Hermetic: block the real IPC sockets so the WS path is exercised.
+    env = {"ARRPC_WS_PORTS": str(WS_PORT), "ARRPC_IPC_DIRS": "/nonexistent-dir-xyz"}
     try:
         time.sleep(0.2)
         act = {"name": "Seanime", "details": "Test Anime",
