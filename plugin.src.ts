@@ -304,5 +304,3 @@ function init() {
         }
     });
 }
-
-export {};

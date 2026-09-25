@@ -304,5 +304,5 @@ function init() {
         }
     });
 }
-
-export {};
+// NOTE: no import/export statements -- Seanime executes the payload as a
+// plain script (not a module) and Goja rejects module syntax.
