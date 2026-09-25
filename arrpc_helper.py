@@ -1,35 +1,15 @@
 #!/usr/bin/env python3
 """Seanime -> arRPC bridge helper (stdlib only).
 
-Sends Discord Rich Presence updates to a local arRPC server (standalone
-`npx arrpc` / `arrpc-bun`, or the arRPC built into Equibop/Vesktop) so that
-Seanime playback shows up in custom Discord clients like Equibop.
-
-Why this helper exists
-----------------------
-Seanime's built-in Discord RPC only tries the single IPC path
-`$XDG_RUNTIME_DIR/discord-ipc-0`. When Seanime Denshi and the Discord client
-disagree about socket directories (Flatpak, systemd env differences, Docker,
-multiple clients occupying `discord-ipc-0`), presence silently never appears.
-This helper tries *every* reasonable transport instead:
-
-  1. Unix IPC sockets `discord-ipc-0..9` in $XDG_RUNTIME_DIR,
-     /run/user/<uid>, $TMPDIR, /tmp (tried first: it is the native Discord
-     protocol, and some bundled arRPC WebSocket endpoints are broken).
-  2. Discord WebSocket RPC on 127.0.0.1:6463-6472 (same protocol the
-     Discord web client uses; arRPC accepts connections with an empty
-     Origin header, which browsers cannot send but this script can).
-
-First transport that completes a handshake + SET_ACTIVITY wins.
-
-Usage (called by the Seanime plugin, but also usable by hand):
-  python3 arrpc_helper.py --client-id 1224777421941899285 --activity '<json>'
-  python3 arrpc_helper.py --client-id 1224777421941899285 --clear
-  python3 arrpc_helper.py --client-id 1224777421941899285 --probe
-  python3 arrpc_helper.py --client-id 1224777421941899285 --daemon --dir /tmp/x
-
-Exit code 0 + "OK <transport>" on stdout means the activity was accepted.
-Anything else is an error (message on stderr, exit code 1).
+Ships two modes used by the Seanime plugin:
+  --daemon   persistent companion: discovers a Discord/arRPC socket
+             (regular IPC dirs plus Flatpak sandbox xdg-run dirs),
+             holds one connection, applies set/clear/probe/exit commands
+             from <dir>/seanime-arrpc-cmd.json, reports to
+             <dir>/seanime-arrpc-status.json.
+  --probe / --activity / --clear   one-shot diagnostics (handshake only
+             for --probe). Always exits 0; the result is an "OK ..." or
+             "ERR ..." line on stdout, which is all the plugin can read.
 
 Only the Python standard library is used.
 """
@@ -82,12 +62,11 @@ def eprint(*args):
 
 
 class SockReader:
-    """Buffered exact-reader: never loses bytes that arrive coalesced.
+    """Buffered exact-reader for WebSocket framing.
 
-    The HTTP upgrade response and the first WebSocket frame often arrive in
-    the same TCP segment; naive recv() loops would swallow frame bytes while
-    scanning for the header terminator. Everything WS-related reads through
-    this buffer.
+    The HTTP upgrade response and the first frame often share one TCP
+    segment; naive recv() loops would swallow frame bytes while scanning
+    for the header terminator.
     """
 
     def __init__(self, sock):
@@ -229,9 +208,8 @@ def ws_connect(client_id):
             sock = socket.create_connection(("127.0.0.1", port), CONNECT_TIMEOUT)
             sock.settimeout(IO_TIMEOUT)
             key = base64.b64encode(os.urandom(16)).decode("ascii")
-            # NOTE: no Origin header on purpose. arRPC rejects browser
-            # origins (anything that is not discord.com); an empty origin
-            # is accepted and is exactly what native RPC clients send.
+            # No Origin header: arRPC only accepts empty (native) origins,
+            # and browsers cannot send one anyway.
             req = (
                 "GET /?v=1&client_id={cid} HTTP/1.1\r\n"
                 "Host: 127.0.0.1:{port}\r\n"
@@ -320,11 +298,8 @@ def ipc_candidate_dirs():
     except Exception:
         pass
     dirs.append("/tmp")
-    # Sandbox layouts
-    # (their discord-ipc fork probes snap.discord + app/com.discordapp.Discord
-    # under each base dir) -- plus the Flatpak xdg-run layout used by
-    # Equibop/Vesktop (`.../.flatpak/<app-id>/xdg-run`), which theirs misses
-    # but which is where those sockets actually live on the host.
+    # Sandbox layouts next to each base: snap / official-Discord Flatpak
+    # paths, plus every Flatpak app's xdg-run dir (Equibop, Vesktop, ...).
     extra = []
     for base in list(dirs):
         for sub in ("snap.discord", "app/com.discordapp.Discord"):
@@ -479,16 +454,12 @@ def _atomic_write_json(path, obj):
 
 
 class Daemon(object):
-    """Holds a single arRPC connection and applies plugin commands.
+    """Holds one arRPC connection and applies plugin commands.
 
-    The Seanime plugin cannot keep sockets (Goja has no socket API and each
-    callback runs isolated), so this daemon owns the connection instead.
     Commands arrive via <dir>/seanime-arrpc-cmd.json:
         {"op": "set", "activity": {...}, "nonce": 7}
-        {"op": "clear", "nonce": 8}
-        {"op": "probe", "nonce": 9}
-        {"op": "exit", "nonce": 10}
-    Status (heartbeat + last result) goes to <dir>/seanime-arrpc-status.json.
+        {"op": "clear" | "probe" | "exit", "nonce": 8}
+    Heartbeat + last result go to <dir>/seanime-arrpc-status.json.
     """
 
     def __init__(self, client_id, directory, interval, transport):
@@ -512,7 +483,7 @@ class Daemon(object):
         self._last_note = ""
 
     def note(self, msg):
-        # Print transitions only -- a per-tick log would spam the plugin console.
+        # Log transitions only; per-tick logging would spam.
         if msg != self._last_note:
             self._last_note = msg
             print("DAEMON %s" % msg, flush=True)
@@ -616,9 +587,8 @@ class Daemon(object):
         self.state["error"] = "PROBE FAILED: %s" % " | ".join(errors)
 
     def read_cmd(self):
-        # The nonce (not the mtime) is the trigger: a failed desired-state
-        # op keeps its nonce unapplied so it is retried every tick until
-        # the server is reachable again.
+        # The nonce is the trigger: a failed set/clear keeps its nonce, so
+        # it is retried until the server is reachable again.
         try:
             with open(self.cmd_path, encoding="utf-8") as f:
                 cmd = json.load(f)
@@ -670,8 +640,8 @@ class Daemon(object):
                             self.apply_probe()
                             self.note("probe -> %s %s"
                                       % (self.state["state"], self.state["transport"] or self.state["error"]))
-                        # Desired-state ops converge by retrying until they
-                        # succeed; one-shot reports (probe) are kept as-is.
+                        # set/clear describe desired state: retry until applied.
+                        # probe is one-shot: keep the reported result.
                         self.last_nonce = cmd.get("nonce")
                 except Exception as exc:
                     self.close_socket()
@@ -771,10 +741,8 @@ def main(argv=None):
                 return 0
             except Exception as exc:
                 errors.append(str(exc))
-        # NOTE: exit 0 with an ERR line (not exit 1). Seanime's
-        # $os.cmd().output() binding only surfaces stdout on success, so a
-        # non-zero exit would hide these reasons behind "exit status 1".
-        # The plugin parses the OK/ERR prefix instead of the exit code.
+        # Exit 0 with an ERR line: $os.cmd().output() only surfaces stdout,
+        # so the plugin parses the OK/ERR prefix instead of the exit code.
         msg = "PROBE FAILED: %s" % " | ".join(errors)
         print("ERR " + msg)
         eprint(msg)
@@ -806,9 +774,7 @@ def main(argv=None):
         except Exception as exc:
             errors.append("websocket: %s" % exc)
     eprint("FAILED: %s" % " | ".join(errors))
-    eprint("HINT: enable arRPC in Equibop Settings -> Rich Presence, "
-           "or run a standalone server with `npx arrpc`.")
-    # Same OK/ERR-protocol note as probe above: report on stdout, exit 0.
+    eprint("HINT: start the Discord client or run `npx arrpc`.")
     print("ERR FAILED: %s" % " | ".join(errors))
     return 0
 
