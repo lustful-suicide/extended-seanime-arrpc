@@ -26,14 +26,16 @@
  */
 
 function init() {
-    // Same application ID as Seanime's native presence, so artwork/buttons
-    // resolve identically in Discord clients.
-    var CLIENT_ID = "1224777421941899285";
-    var HELPER_VERSION = "1.0.0";
-    // Replaced by build.py with the JSON-escaped contents of arrpc_helper.py
-    var HELPER_PY = "__ARRPC_HELPER_PY__";
-
+    // NOTE: the $ui callback below runs in an ISOLATED runtime -- it cannot
+    // read anything declared here (or at file top-level). Every constant it
+    // needs (including the embedded helper) must be declared INSIDE the
+    // callback body. See "Javascript restrictions" in the Seanime docs.
     $ui.register(function (ctx) {
+        // Same application ID as Seanime's native presence, so artwork/buttons
+        // resolve identically in Discord clients.
+        var CLIENT_ID = "1224777421941899285";
+        // Replaced by build.py with the JSON-escaped contents of arrpc_helper.py
+        var HELPER_PY = "__ARRPC_HELPER_PY__";
         var settings = ctx.settings.define("arrpc", {
             enabled: true,
             pythonBin: "python3",
