@@ -190,24 +190,40 @@ function init() {
             lastPlayingFlag = null;
         }
 
-        function pushPlayback(st, so, playing) {
-            var key = st.mediaId + ":" + st.episodeNumber;
+        function pickTitle(media) {
+            if (!media || !media.title) return "Unknown";
+            return media.title.userPreferred || media.title.romaji || media.title.english || media.title.native || "Unknown";
+        }
+
+        function pickCover(media) {
+            if (!media || !media.coverImage) return "";
+            return media.coverImage.extraLarge || media.coverImage.large || media.coverImage.medium || "";
+        }
+
+        function safeCall(fn) {
+            try {
+                return fn();
+            } catch (e) {
+                return undefined;
+            }
+        }
+
+        function pushNormalized(mediaId, title, cover, episode, totalEp, isMovie, progress, duration, playing, force) {
+            if (!mediaId) return;
+            var key = mediaId + ":" + episode;
             var now = Date.now();
             var intervalMs = Math.max(5, settings.get("updateIntervalSec") || 15) * 1000;
-            var changed = (key !== lastKey) || (playing !== lastPlayingFlag);
+            var changed = !!force || (key !== lastKey) || (playing !== lastPlayingFlag);
             if (!changed && (now - lastSentAt) < intervalMs) return;
-            var progress = so.currentTimeInSeconds || 0;
-            var duration = so.durationInSeconds || 0;
-            var totalEp = st.mediaTotalEpisodes || 0;
             var activity = {
                 name: "Seanime",
-                details: st.mediaTitle || "Unknown",
-                details_url: "https://anilist.co/anime/" + st.mediaId,
-                state: totalEp === 1 ? "Watching Movie" : ("Watching Episode " + (st.episodeNumber || 0)),
+                details: title || "Unknown",
+                details_url: "https://anilist.co/anime/" + mediaId,
+                state: isMovie ? "Watching Movie" : ("Watching Episode " + (episode || 0)),
                 assets: {
-                    large_image: st.mediaCoverImage || "",
-                    large_text: st.mediaTitle || "Unknown",
-                    large_url: "https://anilist.co/anime/" + st.mediaId,
+                    large_image: cover || "",
+                    large_text: title || "Unknown",
+                    large_url: "https://anilist.co/anime/" + mediaId,
                 },
                 buttons: [{ label: "Seanime", url: "https://seanime.app" }],
                 instance: true,
@@ -227,9 +243,15 @@ function init() {
                 lastKey = key;
                 lastSentAt = now;
                 lastPlayingFlag = playing;
-                nowPlaying.set((st.mediaTitle || "Unknown") + " - Ep " + (st.episodeNumber || 0) + (playing ? "" : " (paused)"));
+                nowPlaying.set((title || "Unknown") + " - Ep " + (episode || 0) + (playing ? "" : " (paused)"));
                 if (connStatus.get() !== "ok") connStatus.set("sending");
             }
+        }
+
+        function pushPlayback(st, so, playing) {
+            var totalEp = st.mediaTotalEpisodes || 0;
+            pushNormalized(st.mediaId, st.mediaTitle || "Unknown", st.mediaCoverImage || "", st.episodeNumber || 0,
+                totalEp, totalEp === 1, so.currentTimeInSeconds || 0, so.durationInSeconds || 0, playing, false);
         }
 
         ctx.playback.registerEventListener(function (ev) {
@@ -261,6 +283,146 @@ function init() {
                 console.error("[arrpc] listener error: " + String((e && e.message) || e));
             }
         });
+
+        // ---- VideoCore: built-in Denshi player + online streaming web player.
+        // ctx.playback only covers external desktop players (MPV/VLC/...),
+        // so online streaming would otherwise never report anything.
+        var vcInfo = null; // {mediaId, title, cover, episode, totalEp, isMovie}
+
+        function vcFromPlaybackInfo(info) {
+            if (!info) return null;
+            var media = info.media || null;
+            var mediaId = (media && media.id) || (info.onlinestreamParams && info.onlinestreamParams.mediaId) || 0;
+            if (!mediaId) return null;
+            var episode = 0;
+            if (info.episode && typeof info.episode.episodeNumber === "number") episode = info.episode.episodeNumber;
+            else if (info.onlinestreamParams && typeof info.onlinestreamParams.episodeNumber === "number") episode = info.onlinestreamParams.episodeNumber;
+            else if (vcInfo && vcInfo.mediaId === mediaId) episode = vcInfo.episode;
+            var totalEp = (media && media.episodes) || 0;
+            return {
+                mediaId: mediaId,
+                title: pickTitle(media),
+                cover: pickCover(media),
+                episode: episode,
+                totalEp: totalEp,
+                isMovie: !!media && media.format === "MOVIE",
+            };
+        }
+
+        function vcStatus() {
+            // All sync getters; may throw when idle -- safeCall guards.
+            var status = safeCall(function () { return ctx.videoCore.getPlaybackStatus(); });
+            return status || null;
+        }
+
+        function vcReportFromEvent(progress, duration, playing, force) {
+            if (!vcInfo) vcPoll(true);
+            if (!vcInfo) return;
+            if (!playing && settings.get("clearOnPause")) {
+                clearPresence("paused");
+                lastKey = vcInfo.mediaId + ":" + vcInfo.episode;
+                lastPlayingFlag = playing;
+                lastSentAt = Date.now();
+                return;
+            }
+            pushNormalized(vcInfo.mediaId, vcInfo.title, vcInfo.cover, vcInfo.episode, vcInfo.totalEp, vcInfo.isMovie,
+                progress || 0, duration || 0, playing, force);
+        }
+
+        function vcClear() {
+            vcInfo = null;
+            clearPresence("videocore-stopped");
+        }
+
+        // Re-read VideoCore state (poll + cache refresh). Returns true if media present.
+        function vcPoll(quiet) {
+            if (!ctx.videoCore) return false;
+            var info = safeCall(function () { return ctx.videoCore.getCurrentPlaybackInfo(); });
+            var parsed = vcFromPlaybackInfo(info);
+            if (parsed) {
+                vcInfo = parsed;
+                if (!quiet) {
+                    var status = vcStatus();
+                    var playing = status ? !status.paused : true;
+                    if (!playing && settings.get("clearOnPause")) {
+                        clearPresence("paused");
+                        lastKey = parsed.mediaId + ":" + parsed.episode;
+                        lastPlayingFlag = playing;
+                        lastSentAt = Date.now();
+                    } else {
+                        pushNormalized(parsed.mediaId, parsed.title, parsed.cover, parsed.episode, parsed.totalEp, parsed.isMovie,
+                            status ? (status.currentTime || 0) : 0, status ? (status.duration || 0) : 0, playing, false);
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+
+        if (ctx.videoCore && ctx.videoCore.addEventListener) {
+            try {
+                ctx.videoCore.addEventListener("video-loaded", function (ev) {
+                    if (!settings.get("enabled")) return;
+                    var parsed = vcFromPlaybackInfo(ev && ev.state && ev.state.playbackInfo);
+                    if (parsed) vcInfo = parsed;
+                    var status = vcStatus();
+                    vcReportFromEvent(status ? status.currentTime : 0, status ? status.duration : 0, status ? !status.paused : true, true);
+                });
+                ctx.videoCore.addEventListener("video-playback-state", function (ev) {
+                    if (!settings.get("enabled")) return;
+                    var parsed = vcFromPlaybackInfo(ev && ev.state && ev.state.playbackInfo);
+                    if (parsed) vcInfo = parsed;
+                    var status = vcStatus();
+                    vcReportFromEvent(status ? status.currentTime : 0, status ? status.duration : 0, status ? !status.paused : true, false);
+                });
+                ctx.videoCore.addEventListener("video-status", function (ev) {
+                    if (!settings.get("enabled")) return;
+                    vcReportFromEvent(ev ? ev.currentTime : 0, ev ? ev.duration : 0, ev ? !ev.paused : true, false);
+                });
+                ctx.videoCore.addEventListener("video-paused", function (ev) {
+                    if (!settings.get("enabled")) return;
+                    vcReportFromEvent(ev ? ev.currentTime : 0, ev ? ev.duration : 0, false, true);
+                });
+                ctx.videoCore.addEventListener("video-resumed", function (ev) {
+                    if (!settings.get("enabled")) return;
+                    vcReportFromEvent(ev ? ev.currentTime : 0, ev ? ev.duration : 0, true, true);
+                });
+                ctx.videoCore.addEventListener("video-seeked", function (ev) {
+                    if (!settings.get("enabled")) return;
+                    vcReportFromEvent(ev ? ev.currentTime : 0, ev ? ev.duration : 0, ev ? !ev.paused : true, true);
+                });
+                ctx.videoCore.addEventListener("video-ended", function () {
+                    if (!settings.get("enabled")) return;
+                    vcClear();
+                });
+                ctx.videoCore.addEventListener("video-completed", function () {
+                    if (!settings.get("enabled")) return;
+                    vcClear();
+                });
+                ctx.videoCore.addEventListener("video-terminated", function () {
+                    if (!settings.get("enabled")) return;
+                    vcClear();
+                });
+                ctx.videoCore.addEventListener("video-error", function () {
+                    if (!settings.get("enabled")) return;
+                    vcClear();
+                });
+                log("videocore listeners registered");
+            } catch (e) {
+                log("videocore unavailable: " + String((e && e.message) || e));
+            }
+            // Steady poll: covers missed events and re-derives state.
+            if (ctx.setInterval) {
+                ctx.setInterval(function () {
+                    try {
+                        if (!settings.get("enabled")) return;
+                        if (!vcPoll(false) && vcInfo) vcClear();
+                    } catch (e) {
+                        log("videocore poll error: " + String((e && e.message) || e));
+                    }
+                }, 10000);
+            }
+        }
 
         var tray = ctx.newTray({
             tooltipText: "arRPC bridge",

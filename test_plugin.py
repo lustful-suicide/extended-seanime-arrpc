@@ -44,8 +44,14 @@ function makeStubs(captured) {
         state: (initial) => { let v = initial; return { get: () => v, set: (nv) => { v = (typeof nv === "function") ? nv(v) : nv; } }; },
         fieldRef: () => ({ current: null, setValue() {}, onValueChange() {} }),
         setTimeout: (fn) => { captured.timeouts.push(fn); fn(); return () => {}; },
-        setInterval: () => () => {},
+        setInterval: (fn) => { captured.pollFn = fn; return () => {}; },
         playback: { registerEventListener: (cb) => { captured.playbackCb = cb; return () => {}; } },
+        videoCore: {
+            addEventListener: (id, cb) => { captured.vcListeners[id] = cb; },
+            getPlaybackStatus: () => captured.vcStatus,
+            getCurrentPlaybackInfo: () => captured.vcInfo,
+            getCurrentMedia: () => captured.vcMedia,
+        },
         // NOTE: no ctx.discord on purpose -- the plugin must not use it.
         newTray: () => trayStub,
         registerEventHandler: (name, cb) => { captured.handlers[name] = cb; },
@@ -88,7 +94,8 @@ function cmdWrites(s) {
 }
 
 // --- runtime 1: run init(), capture the register callback ---
-const cap1 = { handlers: {}, timeouts: [], statusBody: "{}" };
+const cap1 = { handlers: {}, timeouts: [], statusBody: "{}",
+    vcListeners: {}, vcStatus: null, vcInfo: null, vcMedia: null, pollFn: null };
 let s1 = makeStubs(cap1);
 vm.runInContext(compiled + "\ninit();", s1.sandbox);
 if (typeof cap1.registerCb !== "function") {
@@ -97,7 +104,7 @@ if (typeof cap1.registerCb !== "function") {
 }
 
 // --- runtime 2 (fresh): re-run ONLY the callback source, like Seanime ---
-const cap2 = { handlers: {}, timeouts: [],
+const cap2 = { handlers: {}, timeouts: [], vcListeners: {}, vcStatus: null, vcInfo: null, vcMedia: null, pollFn: null,
     statusBody: JSON.stringify({ alive: Date.now() / 1000, pid: 999, state: "starting", transport: "", error: "", activity: "" }) };
 let s2 = makeStubs(cap2);
 const cbSource = "(" + cap1.registerCb.toString() + ")";
@@ -179,7 +186,60 @@ const cmds3 = cmdWrites(s2);
 if (cmds3[cmds3.length - 1].op !== "probe") { console.error("FAIL: probe handler wrote no probe cmd"); process.exit(1); }
 console.log("PASS Test button -> daemon cmd probe");
 
-// toggle off writes exit cmd
+// --- VideoCore (online streaming; runs before toggle-off disables) ---
+for (const evt of ["video-loaded", "video-playback-state", "video-status", "video-paused", "video-resumed",
+                   "video-seeked", "video-ended", "video-completed", "video-terminated", "video-error"]) {
+    if (typeof cap2.vcListeners[evt] !== "function") { console.error("FAIL: missing videocore listener " + evt); process.exit(1); }
+}
+console.log("PASS videocore listeners registered");
+if (typeof cap2.pollFn !== "function") { console.error("FAIL: videocore poll not scheduled"); process.exit(1); }
+
+function vcMedia() {
+    return { id: 21, format: "TV", episodes: 100,
+             title: { userPreferred: "One Piece", romaji: "One Piece" },
+             coverImage: { large: "http://img/x.jpg" } };
+}
+cap2.vcStatus = { paused: false, currentTime: 60, duration: 1400 };
+const vcSetsBefore = cmdWrites(s2).filter((c) => c.op === "set").length;
+cap2.vcListeners["video-loaded"]({ state: { playbackInfo: {
+    media: vcMedia(), episode: { episodeNumber: 5 },
+    onlinestreamParams: { mediaId: 21, episodeNumber: 5 } } } });
+let vcSets = cmdWrites(s2).filter((c) => c.op === "set");
+if (vcSets.length !== vcSetsBefore + 1) { console.error("FAIL: video-loaded sent no set"); process.exit(1); }
+if (vcSets[vcSets.length - 1].activity.state !== "Watching Episode 5") {
+    console.error("FAIL: bad videocore activity " + JSON.stringify(vcSets[vcSets.length - 1].activity)); process.exit(1);
+}
+console.log("PASS videocore video-loaded -> set (Ep 5)");
+
+// status tick throttled
+const nVc = cmdWrites(s2).length;
+cap2.vcListeners["video-status"]({ currentTime: 61, duration: 1400, paused: false });
+if (cmdWrites(s2).length !== nVc) { console.error("FAIL: videocore tick unthrottled"); process.exit(1); }
+console.log("PASS videocore status tick throttled");
+
+// pause -> clear (clearOnPause default true)
+cap2.vcListeners["video-paused"]({ currentTime: 62, duration: 1400 });
+let vcCmds = cmdWrites(s2);
+if (vcCmds[vcCmds.length - 1].op !== "clear") { console.error("FAIL: videocore pause did not clear"); process.exit(1); }
+console.log("PASS videocore pause -> clear");
+
+// poll with live getters reports; poll with nothing clears
+cap2.vcInfo = { media: vcMedia(), episode: { episodeNumber: 6 },
+                onlinestreamParams: { mediaId: 21, episodeNumber: 6 } };
+cap2.vcStatus = { paused: false, currentTime: 10, duration: 1400 };
+cap2.pollFn();
+vcSets = cmdWrites(s2).filter((c) => c.op === "set");
+if (vcSets[vcSets.length - 1].activity.state !== "Watching Episode 6") {
+    console.error("FAIL: videocore poll sent no set"); process.exit(1);
+}
+console.log("PASS videocore poll -> set (Ep 6)");
+cap2.vcInfo = null; cap2.vcMedia = null;
+cap2.pollFn();
+vcCmds = cmdWrites(s2);
+if (vcCmds[vcCmds.length - 1].op !== "clear") { console.error("FAIL: idle poll did not clear"); process.exit(1); }
+console.log("PASS idle poll clears stale presence");
+
+// toggle off writes exit cmd (runs last: it disables the plugin)
 cap2.handlers["arrpc-toggle"]();
 const cmds4 = cmdWrites(s2);
 if (cmds4[cmds4.length - 1].op !== "exit") { console.error("FAIL: toggle-off wrote no exit cmd"); process.exit(1); }

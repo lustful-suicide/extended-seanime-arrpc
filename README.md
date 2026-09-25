@@ -25,8 +25,10 @@ Seanime's built-in client never looks at.
   command file. Takeover protection, auto-reconnect, and error reporting
   are built in; live state is mirrored to a `$TEMP` status file the tray
   reads.
-- The plugin listens to **all** playback events (local files,
-  torrent/debrid/online streams, manual tracking) and forwards them.
+- The plugin listens to **all** playback events — `ctx.playback` for external
+  desktop players (MPV/VLC/…) **and** `ctx.videoCore` for the built-in Denshi
+  player and the online-streaming web player (which `ctx.playback` never
+  reports) — plus a 10s poll that covers missed events, and forwards them.
 
 It uses Seanime's own Discord application ID (`1224777421941899285`), so
 artwork resolves exactly like native presence.
