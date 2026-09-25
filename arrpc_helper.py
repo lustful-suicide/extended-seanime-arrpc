@@ -477,8 +477,14 @@ def main(argv=None):
                 return 0
             except Exception as exc:
                 errors.append(str(exc))
-        eprint("PROBE FAILED: %s" % " | ".join(errors))
-        return 1
+        # NOTE: exit 0 with an ERR line (not exit 1). Seanime's
+        # $os.cmd().output() binding only surfaces stdout on success, so a
+        # non-zero exit would hide these reasons behind "exit status 1".
+        # The plugin parses the OK/ERR prefix instead of the exit code.
+        msg = "PROBE FAILED: %s" % " | ".join(errors)
+        print("ERR " + msg)
+        eprint(msg)
+        return 0
 
     if args.clear:
         activity = None
@@ -508,7 +514,9 @@ def main(argv=None):
     eprint("FAILED: %s" % " | ".join(errors))
     eprint("HINT: enable arRPC in Equibop Settings -> Rich Presence, "
            "or run a standalone server with `npx arrpc`.")
-    return 1
+    # Same OK/ERR-protocol note as probe above: report on stdout, exit 0.
+    print("ERR FAILED: %s" % " | ".join(errors))
+    return 0
 
 
 if __name__ == "__main__":

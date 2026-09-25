@@ -1,7 +1,7 @@
 {
     "id": "extended-seanime-arrpc",
     "name": "Extended Seanime arRPC",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "manifestURI": "https://raw.githubusercontent.com/lustful-suicide/extended-seanime-arrpc/main/extended-seanime-arrpc.json",
     "language": "typescript",
     "type": "plugin",

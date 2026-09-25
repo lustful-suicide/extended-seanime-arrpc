@@ -59,6 +59,10 @@ function init() {
         // Learned transport ("websocket" | "ipc" | "") -- parsed from the
         // helper's "OK <transport>" line to skip failing transports.
         var transportPref = "";
+        // Session flag: a websocket attempt failed (some bundled builds
+        // close the connection instead of handshaking). Skip WS until the
+        // next manual probe so we don't hammer a broken endpoint.
+        var skipWS = false;
 
         function log(msg) {
             try {
@@ -91,40 +95,54 @@ function init() {
             return $toString(out);
         }
 
+        function trimText(s) {
+            return String(s).replace(/^\s+|\s+$/g, "");
+        }
+
+        // The helper always exits 0 and reports via stdout ("OK ..." or
+        // "ERR ...") because $os.cmd().output() only surfaces stdout.
+        function parseResult(text) {
+            if (text.indexOf("OK websocket") === 0) return { ok: true, transport: "websocket" };
+            if (text.indexOf("OK ipc") === 0) return { ok: true, transport: "ipc" };
+            if (text.indexOf("ERR ") === 0) return { ok: false, message: text.substring(4) };
+            return { ok: false, message: text || "empty helper output" };
+        }
+
         function pushActivity(activity) {
             if (!settings.get("enabled")) return false;
             if (!ensureHelper()) return false;
             connStatus.set("sending");
+            // Did this attempt include the websocket transport?
+            var triedWS = (!transportPref || transportPref === "websocket");
             try {
                 var args = ["--client-id", CLIENT_ID];
                 if (transportPref) {
                     args.push("--transport", transportPref);
+                } else if (skipWS) {
+                    args.push("--transport", "ipc");
+                    triedWS = false;
                 }
                 if (activity === null || activity === undefined) {
                     args.push("--clear");
                 } else {
                     args.push("--activity", JSON.stringify(activity));
                 }
-                var text = runHelper(args);
-                log("helper -> " + text);
-                if (text.indexOf("OK websocket") === 0) {
-                    transportPref = "websocket";
+                var res = parseResult(trimText(runHelper(args)));
+                log("helper -> " + (res.ok ? "OK " + res.transport : res.message));
+                if (res.ok) {
+                    transportPref = res.transport;
                     lastTransport.set(transportPref);
                     connStatus.set("ok");
                     lastError.set("");
                     return true;
                 }
-                if (text.indexOf("OK ipc") === 0) {
-                    transportPref = "ipc";
-                    lastTransport.set(transportPref);
-                    connStatus.set("ok");
-                    lastError.set("");
-                    return true;
-                }
-                throw new Error(text || "empty helper output");
+                if (triedWS) skipWS = true;
+                transportPref = "";
+                throw new Error(res.message);
             } catch (e) {
                 // Forget the preferred transport so the next send re-probes
-                // both (the arRPC server may have restarted on new ports).
+                // (the arRPC server may have restarted on new ports).
+                if (triedWS) skipWS = true;
                 transportPref = "";
                 connStatus.set("error");
                 lastError.set(String((e && e.message) || e));
@@ -189,19 +207,22 @@ function init() {
                 if (manual) ctx.toast.error("arRPC: cannot write helper script");
                 return;
             }
+            // A (manual or startup) probe re-tests every transport.
+            skipWS = false;
             connStatus.set("sending");
             try {
-                var text = runHelper(["--client-id", CLIENT_ID, "--probe"]);
-                log("probe -> " + text);
-                if (text.indexOf("OK ") === 0) {
-                    if (text.indexOf("OK websocket") === 0) transportPref = "websocket";
-                    else if (text.indexOf("OK ipc") === 0) transportPref = "ipc";
+                var res = parseResult(trimText(runHelper(["--client-id", CLIENT_ID, "--probe"])));
+                log("probe -> " + (res.ok ? "OK " + res.transport : res.message));
+                if (res.ok) {
+                    transportPref = res.transport;
                     lastTransport.set(transportPref);
                     connStatus.set("ok");
                     lastError.set("");
-                    if (manual) ctx.toast.success("arRPC reachable (" + transportPref + ")");
+                    if (manual) ctx.toast.success("arRPC reachable (" + res.transport + ")");
                 } else {
-                    throw new Error(text || "probe failed");
+                    if (!transportPref || transportPref === "websocket") skipWS = true;
+                    transportPref = "";
+                    throw new Error(res.message);
                 }
             } catch (e) {
                 transportPref = "";

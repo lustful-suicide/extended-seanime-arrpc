@@ -58,15 +58,27 @@ artwork and buttons resolve exactly like native presence.
 
 Equibop's Flatpak sandbox hides its `discord-ipc-*` sockets from the host, so
 host apps (including Seanime Denshi) can't use IPC to reach its bundled arRPC.
-If **Test connection** fails with everything enabled:
+Worse, I verified live that the bundled `arrpc-bun` accepts a WebSocket
+upgrade on `:6463` and then dies (the process exits; a new PID appears on the
+next check). External apps cannot use it at all.
+If **Test connection** fails with everything enabled, use a standalone server:
 
 - **Option A — standalone arRPC on the host** (most reliable):
-  1. In Equibop settings, turn **off** its built-in Rich Presence (frees
-     ports `6463`/`1337` for the host instance).
-  2. Run `npx arrpc` (or `arrpc-bun`) as a user service on the host.
+  1. In Equibop settings, turn **off** its built-in Rich Presence (arRPC).
+     This stops the bundled server and frees ports `6463`/`1337`.
+  2. Run a standalone server on the host and keep it running:
+     `npx arrpc` (needs Node ≥ 18) or `bunx arrpc-bun`.
   3. In Equibop, enable the **WebRichPresence (arRPC)** plugin so it displays
-     what the host server receives.
-  4. Re-run **Test connection** — expect `ok (websocket)` or `ok (ipc)`.
+     what the host server receives. The plugin is hidden on Vesktop-based
+     clients — if you don't see it, close Equibop and edit
+     `~/.var/app/org.equicord.equibop/config/equibop/settings/settings.json`,
+     adding `"WebRichPresence (arRPC)": true` under `plugins`, then restart.
+     It only connects to `ws://127.0.0.1:1337`, which is why step 1 matters.
+  4. Back in Seanime, press **Test connection** — expect `ok (websocket)`
+     or `ok (ipc)`. Play an episode; presence appears within seconds.
+  The plugin remembers the working transport and, after a websocket failure,
+  sticks to IPC until the next manual probe, so a broken bundled endpoint
+  can't flap your status.
 - **Option B — expose the sandbox socket**: follow Equibop's Flatpak wiki
   (`discord-ipc-0` tmpfiles symlink) so the sandbox socket appears at
   `/run/user/$UID/discord-ipc-0` on the host. Then IPC works directly.
@@ -110,5 +122,8 @@ If **Test connection** fails with everything enabled:
   (the published payload). Run after every edit: `python3 build.py`.
 - `test_helper.py` — helper self-tests against fake arRPC servers:
   `python3 test_helper.py`.
+- `test_plugin.py` — runs the compiled payload in isolated `node:vm`
+  contexts like Seanime's runtimes, drives playback/tray handlers:
+  `python3 test_plugin.py`.
 - `node --check arrpc-bridge.ts` — payload syntax check.
 - `extended-seanime-arrpc.json` — extension manifest (`id` matches filename).

@@ -216,11 +216,15 @@ def test_bad_activity_json():
 
 
 def test_no_server_fails_cleanly():
+    # No server: helper reports ERR on stdout but exits 0 (Seanime's
+    # $os.cmd().output() binding only surfaces stdout on success, so the
+    # plugin parses the OK/ERR prefix instead of the exit code).
     env = {"ARRPC_WS_PORTS": "6498", "ARRPC_IPC_DIRS": "/nonexistent-dir-xyz"}
     r = run_helper(["--client-id", CLIENT_ID, "--probe"], env)
-    assert r.returncode == 1, r
-    assert "FAILED" in r.stderr or "PROBE FAILED" in r.stderr, r.stderr
-    print("PASS clean failure with no server")
+    assert r.returncode == 0, r
+    assert r.stdout.startswith("ERR "), r.stdout
+    assert "websocket" in r.stdout and "ipc" in r.stdout, r.stdout
+    print("PASS clean ERR report with no server")
 
 
 if __name__ == "__main__":
