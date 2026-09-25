@@ -13,12 +13,10 @@ Seanime's built-in client never looks at.
 - On load, the plugin spawns a small persistent companion (the embedded
   stdlib-only Python helper in `--daemon` mode, via a non-blocking async
   command — the UI never freezes).
-- The daemon searches every IPC location like dedicated RPC libraries do
-  (e.g. LiquidBounce's `DiscordIpcPipeLocator` checks `$XDG_RUNTIME_DIR`,
-  `$TMPDIR`, `/tmp` plus `snap.discord` / `app/com.discordapp.Discord`
-  sandbox subdirs) — **and goes one further**, globbing
-  `/run/user/<uid>/.flatpak/*/xdg-run`, which is where Equibop/Vesktop
-  Flatpak sockets actually live on the host but which those libraries miss.
+- The daemon searches every IPC location — `$XDG_RUNTIME_DIR`, `$TMPDIR`,
+  `/tmp`, `snap.discord` / `app/com.discordapp.Discord` sandbox subdirs, plus
+  a `/run/user/<uid>/.flatpak/*/xdg-run` glob, which is where Equibop/Vesktop
+  Flatpak sockets actually live on the host.
 - It holds **one** connection open (presence requires persistence — a
   fire-and-forget send is cleared by the server the moment its socket
   closes) and applies playback states the plugin drops into a `$TEMP`

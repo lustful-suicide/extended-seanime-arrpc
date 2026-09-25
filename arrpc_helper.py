@@ -37,9 +37,8 @@ WS_PORTS = list(range(6463, 6473))
 IPC_TRIES = list(range(0, 10))
 CONNECT_TIMEOUT = 2.0
 IO_TIMEOUT = 5.0
-# How long to wait for the DISPATCH/READY frame after the WS handshake.
-# Some bundled arRPC builds (e.g. Equibop Flatpak) accept the upgrade and
-# then close without ever sending READY -- treat that as transport failure.
+# Bundled arRPC builds may accept the upgrade then go silent;
+# treat that as transport failure.
 READY_TIMEOUT = 2.5
 
 
@@ -224,7 +223,6 @@ def ws_connect(client_id):
             code, _ = ws_read_http_response(reader)
             if code != 101:
                 raise ConnectionError("port %d: HTTP %s" % (port, code))
-            # arRPC sends DISPATCH/READY immediately on connect.
             ws_wait_ready(reader, sock, port)
             return sock, reader, "websocket:127.0.0.1:%d" % port
         except Exception as exc:  # try next port
@@ -240,7 +238,6 @@ def ws_connect(client_id):
 def ws_request(sock, reader, payload_obj):
     """Send one SET_ACTIVITY payload over a connected socket. Returns reply."""
     ws_send_text(sock, json.dumps(payload_obj))
-    # Read reply (skip pings).
     for _ in range(5):
         opcode, payload = ws_recv_frame(reader)
         if opcode == 9:  # ping -> pong
@@ -304,7 +301,6 @@ def ipc_candidate_dirs():
     for base in list(dirs):
         for sub in ("snap.discord", "app/com.discordapp.Discord"):
             extra.append(os.path.join(base, sub))
-    # Dedupe, keep order, keep only existing directories.
     seen = set()
     out = []
     for d in dirs + extra + flatpak_socket_dirs():
@@ -373,7 +369,6 @@ def ipc_connect(client_id):
                 sock.connect(path)
                 ipc_send(sock, OP_HANDSHAKE,
                          json.dumps({"v": "1", "client_id": client_id}))
-                # Server replies DISPATCH/READY (or PING/CLOSE).
                 for _ in range(3):
                     opcode, msg = ipc_recv(sock)
                     if opcode == OP_PING:
@@ -548,7 +543,6 @@ class Daemon(object):
                 self.connect()
             self.send(activity)
         except Exception:
-            # Reconnect once, then retry the send on the fresh socket.
             self.connect()
             self.send(activity)
         if activity:
@@ -601,7 +595,6 @@ class Daemon(object):
         return cmd
 
     def run(self):
-        # Takeover: if another daemon is alive, quietly exit.
         try:
             with open(self.status_path, encoding="utf-8") as f:
                 prev = json.load(f)
@@ -652,8 +645,6 @@ class Daemon(object):
                         self.last_nonce = None  # retry desired state
                     else:
                         self.last_nonce = cmd.get("nonce") if cmd else self.last_nonce
-                # Keepalive: re-assert current activity so a silently dropped
-                # connection (client restarted while idle) heals itself.
                 if (self.sock is not None and self.last_activity
                         and time.time() - self.last_send_at > REASSERT_AFTER_SEC):
                     try:

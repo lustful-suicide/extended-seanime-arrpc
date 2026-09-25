@@ -273,9 +273,8 @@ function init() {
             }
         });
 
-        // ---- VideoCore: built-in Denshi player + online streaming web player.
-        // ctx.playback only covers external desktop players (MPV/VLC/...),
-        // so online streaming would otherwise never report anything.
+        // ---- VideoCore: built-in player + online streaming (ctx.playback
+        // only covers external desktop players).
         var vcInfo = null; // {mediaId, title, cover, episode, totalEp, isMovie}
 
         function vcFromPlaybackInfo(info) {
@@ -323,7 +322,7 @@ function init() {
             clearPresence("videocore-stopped");
         }
 
-        // Re-read VideoCore state (poll + cache refresh). Returns true if media present.
+        // Re-read VideoCore state. Returns true if media present.
         function vcPoll(quiet) {
             if (!ctx.videoCore) return false;
             var info = safeCall(function () { return ctx.videoCore.getCurrentPlaybackInfo(); });
@@ -380,22 +379,14 @@ function init() {
                     if (!settings.get("enabled")) return;
                     vcReportFromEvent(ev ? ev.currentTime : 0, ev ? ev.duration : 0, ev ? !ev.paused : true, true);
                 });
-                ctx.videoCore.addEventListener("video-ended", function () {
+                function vcStop() {
                     if (!settings.get("enabled")) return;
                     vcClear();
-                });
-                ctx.videoCore.addEventListener("video-completed", function () {
-                    if (!settings.get("enabled")) return;
-                    vcClear();
-                });
-                ctx.videoCore.addEventListener("video-terminated", function () {
-                    if (!settings.get("enabled")) return;
-                    vcClear();
-                });
-                ctx.videoCore.addEventListener("video-error", function () {
-                    if (!settings.get("enabled")) return;
-                    vcClear();
-                });
+                }
+                ctx.videoCore.addEventListener("video-ended", vcStop);
+                ctx.videoCore.addEventListener("video-completed", vcStop);
+                ctx.videoCore.addEventListener("video-terminated", vcStop);
+                ctx.videoCore.addEventListener("video-error", vcStop);
                 log("videocore listeners registered");
             } catch (e) {
                 log("videocore unavailable: " + String((e && e.message) || e));

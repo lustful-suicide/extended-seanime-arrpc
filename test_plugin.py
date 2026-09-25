@@ -5,9 +5,9 @@ captured $ui.register callback, and re-executes ONLY its source in a fresh
 context with stubbed Seanime APIs (like Seanime's isolated UI runtime).
 Any reference to an outer variable raises ReferenceError here.
 
-Asserts the LiquidBounce-style contract: the plugin NEVER sends activity
-itself -- it spawns ONE daemon via $osExtra.asyncCmd and talks to it only
-through $TEMP command files, while status comes back through status files.
+Contract under test: the plugin NEVER sends activity itself -- it spawns
+ONE daemon via $osExtra.asyncCmd and talks to it only through $TEMP
+command files, while status comes back through status files.
 """
 import os
 import subprocess
